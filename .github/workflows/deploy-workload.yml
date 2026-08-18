@@ -1,0 +1,88 @@
+# GitOps deployment engine — "AI DevOps pipelines" as GitHub Actions.
+#
+# The control plane (or an operator) dispatches this workflow with a workload,
+# backend and client. It plans against the client's *delegated* account and
+# applies only after environment approval — the client's consumption never
+# touches our bill.
+#
+# Secrets per client live in GitHub Environments (one environment per client):
+#   AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID  (OIDC federation)
+#   AWS_DELEGATED_ROLE_ARN                                     (cross-account role, OIDC)
+#   OS_CLOUD config for Catalyst application credentials
+
+name: Deploy workload
+
+on:
+  workflow_dispatch:
+    inputs:
+      workload:
+        description: "Catalog workload id"
+        required: true
+        type: choice
+        options:
+          - sovereign-rag
+      backend:
+        description: "Target backend"
+        required: true
+        type: choice
+        options:
+          - catalyst
+          - azure
+          - aws
+      client:
+        description: "Client environment name (maps to a GitHub Environment holding delegated credentials)"
+        required: true
+        type: string
+      apply:
+        description: "Apply after plan (otherwise plan only)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write # OIDC federation into client Azure/AWS accounts
+  contents: read
+
+jobs:
+  plan:
+    name: Validate & plan (${{ inputs.workload }} → ${{ inputs.backend }})
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.client }}
+    defaults:
+      run:
+        working-directory: infra/modules/${{ inputs.workload }}/${{ inputs.backend }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.x"
+
+      - name: Terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init
+        run: terraform init -backend=false
+
+      - name: Terraform validate
+        run: terraform validate
+
+      # Plan/apply steps are intentionally gated: real state backends and
+      # per-client tfvars are wired in when the client environment is
+      # onboarded. Until then this pipeline is the validation spine.
+      - name: Terraform plan
+        if: ${{ inputs.apply }}
+        run: echo "terraform plan -var-file=clients/${{ inputs.client }}.tfvars (enabled at client onboarding)"
+
+  apply:
+    name: Apply (approval-gated)
+    needs: plan
+    if: ${{ inputs.apply }}
+    runs-on: ubuntu-latest
+    # The -approvals environment carries required reviewers: a human guardian
+    # signs off every apply. Named Guardian Model, enforced by the pipeline.
+    environment: ${{ inputs.client }}-approvals
+    steps:
+      - uses: actions/checkout@v4
+      - name: Terraform apply
+        run: echo "terraform apply tfplan (enabled at client onboarding)"
